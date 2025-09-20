@@ -1,121 +1,115 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import plotly.graph_objs as go
-from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import datetime
 
-# -------------------------
+# -------------------------------
+# App Configuration
+# -------------------------------
+st.set_page_config(page_title="Stock Market Consultant Agent", layout="wide")
+st.title("📊 Stock Market Consultant Agent")
+st.write("Beginner-friendly guidance for your investments — live data, portfolio analysis, and clear advice.")
+
+# -------------------------------
 # Helper Functions
-# -------------------------
-def get_stock_data(ticker, period="6mo"):
+# -------------------------------
+def fetch_stock_data(ticker, period="6mo"):
+    """Fetch stock data safely"""
     try:
-        data = yf.download(ticker, period=period, interval="1d")
+        stock = yf.Ticker(ticker)
+        data = stock.history(period=period)
         if data.empty:
             return None
         return data
     except Exception as e:
-        st.error(f"Error fetching data: {e}")
+        st.error(f"Error fetching data for {ticker}: {e}")
         return None
 
-def plot_candlestick(data, ticker):
-    fig = go.Figure(data=[go.Candlestick(
-        x=data.index,
-        open=data['Open'],
-        high=data['High'],
-        low=data['Low'],
-        close=data['Close'],
-        name="Candlestick"
-    )])
-    # Add moving averages
-    for ma in [20, 50, 200]:
-        data[f"MA{ma}"] = data['Close'].rolling(ma).mean()
-        fig.add_trace(go.Scatter(x=data.index, y=data[f"MA{ma}"], mode='lines', name=f"MA{ma}"))
-    fig.update_layout(title=f"{ticker} Stock Price", xaxis_rangeslider_visible=False)
-    return fig
+def analyze_portfolio(portfolio):
+    """Provide beginner-friendly advice based on portfolio"""
+    advice = []
+    sectors = set()
+    
+    for stock in portfolio:
+        data = fetch_stock_data(stock)
+        if data is not None and len(data) >= 2:
+            latest_price = data['Close'].dropna().iloc[-1]
+            prev_price = data['Close'].dropna().iloc[-2]
+            pct_change = ((latest_price - prev_price) / prev_price) * 100
 
-def get_recommendations():
-    # Example beginner-friendly suggestions
-    return {
-        "Safe Choices": ["RELIANCE.NS", "TCS.NS", "INFY.NS"],
-        "High Risk - High Reward": ["ZOMATO.NS", "PAYTM.NS"]
-    }
+            if pct_change > 2:
+                advice.append(f"📈 {stock}: Price rising fast — consider booking partial profit.")
+            elif pct_change < -2:
+                advice.append(f"📉 {stock}: Price falling — review your risk tolerance.")
+            else:
+                advice.append(f"🤝 {stock}: Stable — holding is reasonable.")
 
-# -------------------------
-# Streamlit App
-# -------------------------
-st.set_page_config(page_title="Stock Market Consultant", layout="wide")
-st.title("📈 Stock Market Consultant for Beginners")
+            # Dummy sector logic (in real system fetch via API/DB)
+            if "INFY" in stock or "TCS" in stock:
+                sectors.add("IT")
+            elif "HDFC" in stock or "ICICI" in stock:
+                sectors.add("Banking")
+        else:
+            advice.append(f"⚠️ {stock}: Data unavailable.")
 
-st.sidebar.header("Choose a Stock")
-ticker = st.sidebar.text_input("Enter Stock Ticker (e.g., RELIANCE.NS, AAPL)", "RELIANCE.NS")
+    if len(sectors) < 2:
+        advice.append("⚠️ Your portfolio lacks diversification. Try adding stocks from different sectors.")
 
-period = st.sidebar.selectbox("Period", ["1mo", "3mo", "6mo", "1y", "2y"])
-data = get_stock_data(ticker, period)
+    return advice
 
-if data is not None:
-    st.subheader(f"Real-Time Data for {ticker}")
-    latest_price = data['Close'].iloc[-1]
-    prev_price = data['Close'].iloc[-2]
-    change = latest_price - prev_price
-    pct_change = (change / prev_price) * 100
+def plot_stock(ticker):
+    """Plot stock price chart"""
+    data = fetch_stock_data(ticker)
+    if data is not None and not data['Close'].isna().all():
+        st.subheader(f"📉 Price Trend for {ticker}")
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(data.index, data['Close'], label='Closing Price')
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Price (₹)")
+        ax.legend()
+        st.pyplot(fig)
 
-    st.metric("Latest Price", f"₹{latest_price:.2f}", f"{pct_change:.2f}%")
+        # ✅ Safe metric display
+        if len(data['Close'].dropna()) >= 2:
+            latest_price = data['Close'].dropna().iloc[-1]
+            prev_price = data['Close'].dropna().iloc[-2]
+            change = latest_price - prev_price
+            pct_change = (change / prev_price) * 100
+            st.metric("Latest Price", f"₹{latest_price:.2f}", f"{pct_change:.2f}%")
+        else:
+            st.warning("Not enough valid data to display latest price.")
+    else:
+        st.warning(f"No chart data for {ticker}")
 
-    st.plotly_chart(plot_candlestick(data, ticker), use_container_width=True)
-else:
-    st.warning("No data found for this ticker.")
+# -------------------------------
+# User Inputs
+# -------------------------------
+st.sidebar.header("📌 Portfolio Input")
+portfolio_input = st.sidebar.text_area("Enter your stock symbols (comma separated, e.g., RELIANCE.NS, TCS.NS, INFY.NS):")
+analyze_btn = st.sidebar.button("Analyze Portfolio")
 
-# -------------------------
-# Portfolio Tracker
-# -------------------------
-st.header("💼 Your Portfolio Tracker")
+# -------------------------------
+# Portfolio Analysis
+# -------------------------------
+if analyze_btn and portfolio_input:
+    portfolio = [s.strip() for s in portfolio_input.split(",")]
+    st.subheader("🧾 Portfolio Advice")
+    advice = analyze_portfolio(portfolio)
+    for line in advice:
+        st.write(line)
 
-if "portfolio" not in st.session_state:
-    st.session_state.portfolio = []
+    # Plot for each stock
+    for stock in portfolio:
+        plot_stock(stock)
 
-with st.form("Add Stock"):
-    stock_ticker = st.text_input("Stock Ticker (e.g., TCS.NS)")
-    qty = st.number_input("Quantity", min_value=1, value=1)
-    buy_price = st.number_input("Buy Price (₹)", min_value=1.0, value=100.0)
-    submitted = st.form_submit_button("Add to Portfolio")
+# -------------------------------
+# Usage Counter
+# -------------------------------
+if "usage_count" not in st.session_state:
+    st.session_state.usage_count = 0
 
-    if submitted:
-        st.session_state.portfolio.append({"Ticker": stock_ticker, "Qty": qty, "Buy Price": buy_price})
-        st.success(f"Added {stock_ticker} to portfolio!")
+if analyze_btn:
+    st.session_state.usage_count += 1
 
-if st.session_state.portfolio:
-    portfolio_data = []
-    total_value, total_cost = 0, 0
-    for stock in st.session_state.portfolio:
-        stock_data = get_stock_data(stock["Ticker"], "1mo")
-        if stock_data is not None:
-            current_price = stock_data['Close'].iloc[-1]
-            value = stock["Qty"] * current_price
-            cost = stock["Qty"] * stock["Buy Price"]
-            pl = value - cost
-            portfolio_data.append([stock["Ticker"], stock["Qty"], stock["Buy Price"], current_price, value, pl])
-            total_value += value
-            total_cost += cost
-    df = pd.DataFrame(portfolio_data, columns=["Ticker", "Qty", "Buy Price", "Current Price", "Value", "P/L"])
-    st.dataframe(df)
-    st.subheader(f"📊 Total Portfolio Value: ₹{total_value:.2f} | P/L: ₹{total_value-total_cost:.2f}")
-
-# -------------------------
-# Beginner Guide
-# -------------------------
-st.header("🧑‍🏫 Beginner Investment Advice")
-st.info("""
-- **Start Small:** Invest only what you can afford to lose.  
-- **Diversify:** Don’t put all money in one stock.  
-- **Focus on Blue-Chip:** Safer for beginners (Reliance, Infosys, TCS).  
-- **Avoid Day Trading:** Start with long-term investments.  
-- **Learn Indicators:** Moving averages, P/E ratio, market cap.  
-""")
-
-# -------------------------
-# Suggested Stocks
-# -------------------------
-st.header("🔍 Stock Suggestions for Beginners")
-recommendations = get_recommendations()
-st.success(f"Safe Choices: {', '.join(recommendations['Safe Choices'])}")
-st.error(f"Risky Picks: {', '.join(recommendations['High Risk - High Reward'])}")
+st.sidebar.markdown(f"🔢 **Advice Generated:** {st.session_state.usage_count}")
