@@ -39,7 +39,7 @@ quantities = [int(q.strip()) for q in quantities_input.split(",")] if quantities
 # --------------------------
 def fetch_stock_data(tickers):
     try:
-        data = yf.download(tickers, period="5d")["Adj Close"]
+        data = yf.download(tickers, period="5d")["Close"]
         return data
     except Exception as e:
         st.error(f"Error fetching data: {e}")
