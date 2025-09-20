@@ -8,3 +8,7 @@ numpy
 requests
 google-genai
 matplotlib
+deepagents
+langchain
+langchain-openai
+
