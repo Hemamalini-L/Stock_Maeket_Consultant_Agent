@@ -1,124 +1,171 @@
-import streamlit as st
+import os
 import yfinance as yf
-import sqlite3
-import datetime
-import pandas as pd
-from openai import OpenAI
+import streamlit as st
+import plotly.graph_objects as go
+from agno.agent import Agent
+from agno.models.google import Gemini
 
-# =========================
-#  API SETUP
-# =========================
-# ✅ OPTION 1: Hardcode API key (for testing only!)
-client = OpenAI(api_key="sk-YOUR_REAL_KEY_HERE")
+# ==============================
+# Helper Functions
+# ==============================
 
-# ✅ OPTION 2 (Recommended for deployment):
-# client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+def compare_stocks(symbols):
+    """Compare stock % change over last 6 months"""
+    data = {}
+    for symbol in symbols:
+        try:
+            stock = yf.Ticker(symbol)
+            hist = stock.history(period="6mo")
 
-# =========================
-#  DATABASE SETUP
-# =========================
-def init_db():
-    conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            email TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
+            if hist.empty:
+                continue
+            data[symbol] = round(hist['Close'].pct_change().sum() * 100, 2)
+        except Exception as e:
+            print(f"Error fetching {symbol}: {e}")
+            continue
+    return data
 
-def add_user(name, email):
-    conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    c.execute("INSERT INTO users (name, email) VALUES (?, ?)", (name, email))
-    conn.commit()
-    conn.close()
 
-# =========================
-#  STOCK DATA FETCH
-# =========================
-def get_stock_data(ticker):
+def get_company_info(symbol):
+    stock = yf.Ticker(symbol)
+    info = stock.info
+    return {
+        "name": info.get("longName", "N/A"),
+        "sector": info.get("sector", "N/A"),
+        "market_cap": info.get("marketCap", "N/A"),
+        "summary": info.get("longBusinessSummary", "N/A"),
+    }
+
+
+def get_company_news(symbol):
+    stock = yf.Ticker(symbol)
     try:
-        stock = yf.Ticker(ticker)
-        data = stock.history(period="1mo")
-        if data.empty:
-            st.error("No data found for this ticker.")
-            return None
-        return data
-    except Exception as e:
-        st.error(f"Error fetching stock data: {e}")
-        return None
+        return stock.news[:5]
+    except Exception:
+        return []
 
-# =========================
-#  AI ADVICE
-# =========================
-def generate_advice(data, ticker):
-    latest_price = round(data["Close"].iloc[-1], 2)
-    pct_change = round(((data["Close"].iloc[-1] - data["Close"].iloc[0]) / data["Close"].iloc[0]) * 100, 2)
 
-    prompt = f"""
-    You are a financial advisor. A beginner investor is asking about {ticker}.
-    The current price is {latest_price}, and the stock has changed {pct_change}% in the last month.
-    Give a clear and simple recommendation: BUY, SELL, or HOLD.
-    Also explain risks, beginner-friendly tips, and current market value insights.
-    """
+# ==============================
+# Define Agents
+# ==============================
 
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "system", "content": "You are a financial stock advisor."},
-                      {"role": "user", "content": prompt}]
-        )
-        advice = response.choices[0].message.content.strip()
-    except Exception as e:
-        advice = f"Error generating AI advice: {e}"
+market_analyst = Agent(
+    model=Gemini(id="gemini-2.5-flash"),
+    description="Analyzes stock performance",
+    instructions=[
+        "Compare stock performance over 6 months",
+        "Rank stocks based on % change",
+    ],
+    markdown=True,
+)
 
-    return latest_price, pct_change, advice
+company_researcher = Agent(
+    model=Gemini(id="gemini-2.5-flash"),
+    description="Analyzes company fundamentals and news",
+    instructions=[
+        "Summarize company profile and sector",
+        "Add key news updates",
+    ],
+    markdown=True,
+)
 
-# =========================
-#  STREAMLIT UI
-# =========================
-def main():
-    st.set_page_config(page_title="AI Stock Advisor", layout="wide")
-    st.title("📈 AI-Powered Stock Investment Advisor")
+stock_strategist = Agent(
+    model=Gemini(id="gemini-2.5-flash"),
+    description="Recommends best stocks",
+    instructions=[
+        "Use performance + fundamentals",
+        "Provide Buy/Hold/Sell advice",
+    ],
+    markdown=True,
+)
 
-    # User Registration
-    st.sidebar.header("👤 New User Registration")
-    name = st.sidebar.text_input("Name")
-    email = st.sidebar.text_input("Email")
-    if st.sidebar.button("Register"):
-        if name and email:
-            add_user(name, email)
-            st.sidebar.success("User registered successfully!")
-        else:
-            st.sidebar.error("Please enter both name and email.")
+team_lead = Agent(
+    model=Gemini(id="gemini-2.5-flash"),
+    description="Final investment report",
+    instructions=[
+        "Aggregate insights from analysts",
+        "Make a final ranked recommendation",
+    ],
+    markdown=True,
+)
 
-    # Stock input
-    ticker = st.text_input("Enter Stock Ticker (e.g., TCS.NS, INFY.NS, AAPL)", "AAPL")
 
-    if st.button("Get Stock Insights"):
-        data = get_stock_data(ticker)
-        if data is not None:
-            st.subheader(f"📊 Stock Data for {ticker}")
-            st.line_chart(data["Close"])
+# ==============================
+# Pipeline Functions
+# ==============================
 
-            latest_price, pct_change, advice = generate_advice(data, ticker)
+def get_market_analysis(symbols):
+    perf = compare_stocks(symbols)
+    if not perf:
+        return "No valid stock data found."
+    return market_analyst.run(f"Compare stock performance: {perf}").content
 
-            st.metric(label="Latest Price", value=f"${latest_price}")
-            st.metric(label="1-Month Change", value=f"{pct_change}%")
 
-            st.subheader("🤖 AI Investment Advice")
-            st.write(advice)
+def get_company_analysis(symbol):
+    info = get_company_info(symbol)
+    news = get_company_news(symbol)
+    return company_researcher.run(
+        f"Company: {info['name']} ({symbol})\n"
+        f"Sector: {info['sector']}\n"
+        f"Market Cap: {info['market_cap']}\n"
+        f"Summary: {info['summary']}\n"
+        f"News: {news}\n"
+    ).content
 
-            st.warning("⚠️ Investment Disclaimer: This is AI-generated advice. Please consult a financial advisor before making decisions.")
 
-# =========================
-#  RUN
-# =========================
-if __name__ == "__main__":
-    init_db()
-    main()
+def get_final_report(symbols):
+    market = get_market_analysis(symbols)
+    companies = {s: get_company_analysis(s) for s in symbols}
+    strategy = stock_strategist.run(
+        f"Market: {market}\nCompanies: {companies}\n"
+    ).content
+
+    return team_lead.run(
+        f"Market Analysis: {market}\n"
+        f"Company Analyses: {companies}\n"
+        f"Strategy: {strategy}\n"
+        f"Final ranked Buy/Hold/Sell recommendations please."
+    ).content
+
+
+# ==============================
+# Streamlit App
+# ==============================
+
+st.set_page_config(page_title="AI Stock Insights", page_icon="📈", layout="wide")
+st.title("📈 AI-Powered Stock Market Insights")
+st.caption("Backed by Gemini + Yahoo Finance")
+
+with st.sidebar:
+    api_key = st.text_input("🔑 Enter your Gemini API key", type="password")
+    st.markdown("---")
+    st.markdown("Built with ❤️ using [Build Fast with AI](https://buildfastwithai.com)")
+
+if not api_key:
+    st.warning("Please enter your Gemini API key to continue.")
+    st.stop()
+
+os.environ["GOOGLE_API_KEY"] = api_key
+
+# Stock input
+symbols = st.text_input("Enter stock symbols (comma separated)", "AAPL, TSLA, GOOG")
+symbols = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+
+if st.button("🚀 Generate Investment Report"):
+    with st.spinner("Analyzing..."):
+        report = get_final_report(symbols)
+
+    st.subheader("📊 Investment Report")
+    st.markdown(report)
+
+    # Plot stock performance
+    st.subheader("📈 Stock Performance (6 months)")
+    data = yf.download(symbols, period="6mo")["Close"]
+
+    fig = go.Figure()
+    for sym in symbols:
+        if sym in data:
+            fig.add_trace(go.Scatter(x=data.index, y=data[sym], mode="lines", name=sym))
+
+    fig.update_layout(title="6-Month Stock Trend", xaxis_title="Date", yaxis_title="Price (USD)")
+    st.plotly_chart(fig)
