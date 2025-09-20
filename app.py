@@ -1,163 +1,157 @@
-import streamlit as st
-import yfinance as yf
+import os
 import sqlite3
-from datetime import datetime
-from openai import OpenAI
-import plotly.graph_objects as go
+import yfinance as yf
 import pandas as pd
+import streamlit as st
+import matplotlib.pyplot as plt
+from openai import OpenAI
 
-# Initialize OpenAI client
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+# --------------------------
+# API KEY SETUP
+# --------------------------
+api_key = None
+try:
+    api_key = st.secrets["OPENAI_API_KEY"]
+except Exception:
+    pass
 
-# Database setup
-conn = sqlite3.connect("users.db", check_same_thread=False)
-c = conn.cursor()
-c.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT,
-    portfolio TEXT,
-    created_at TIMESTAMP
-)
-""")
-c.execute("""
-CREATE TABLE IF NOT EXISTS usage (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    queries INTEGER,
-    portfolios INTEGER,
-    last_used TIMESTAMP
-)
-""")
-conn.commit()
+if not api_key:
+    api_key = os.getenv("OPENAI_API_KEY")
 
-# --- Functions ---
-def fetch_stock_data(symbol):
-    """Fetch last 3 months stock history"""
+if not api_key:
+    api_key = "sk-your-test-key-here"  # Replace only for local testing
+
+client = OpenAI(api_key=api_key)
+
+# --------------------------
+# SQLITE DATABASE SETUP
+# --------------------------
+DB_FILE = "stock_consultant.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            portfolio TEXT,
+            usage_count INTEGER DEFAULT 0
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def save_user(name, portfolio):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT INTO users (name, portfolio, usage_count) VALUES (?, ?, ?)", 
+              (name, portfolio, 0))
+    conn.commit()
+    conn.close()
+
+def update_usage(name):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE users SET usage_count = usage_count + 1 WHERE name=?", (name,))
+    conn.commit()
+    conn.close()
+
+def get_usage(name):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT usage_count FROM users WHERE name=?", (name,))
+    result = c.fetchone()
+    conn.close()
+    return result[0] if result else 0
+
+init_db()
+
+# --------------------------
+# STOCK DATA FUNCTIONS
+# --------------------------
+def get_stock_data(symbol, period="6mo"):
     stock = yf.Ticker(symbol)
-    hist = stock.history(period="3mo")
-    return hist
+    data = stock.history(period=period)
+    return data
 
-def generate_advice(stock_name, latest_price, pct_change):
-    """Generate plain English stock advice"""
+def plot_stock(data, symbol):
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(data.index, data["Close"], label="Close Price", color="blue")
+    ax.set_title(f"{symbol} Price Trend")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Price (₹)")
+    ax.legend()
+    st.pyplot(fig)
+
+# --------------------------
+# AI ADVICE GENERATOR
+# --------------------------
+def generate_advice(portfolio, stock_data):
     prompt = f"""
-    You are a stock consultant. A beginner investor is holding {stock_name}.
-    Latest price: {latest_price:.2f} INR. Daily change: {pct_change:.2f}%.
-    
-    Give simple advice in one line: Should they BUY, SELL, HOLD, or DIVERSIFY?
-    Also explain the risk in plain English.
+    You are a financial consultant for beginner investors.
+    The user's portfolio is: {portfolio}.
+    Based on the latest stock data: {stock_data.tail(5).to_dict()},
+    provide simple advice:
+    - Whether to Buy, Hold, or Sell.
+    - Risk warnings (if any).
+    - Diversification tips.
+    Answer in plain English, short and clear.
     """
+
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "system", "content": "You are a helpful stock consultant."},
                   {"role": "user", "content": prompt}]
     )
-    return response.choices[0].message.content.strip()
 
-def update_usage(user_id, query=False, portfolio=False):
-    """Update usage counters"""
-    c.execute("SELECT * FROM usage WHERE user_id=?", (user_id,))
-    row = c.fetchone()
-    if row:
-        queries = row[2] + (1 if query else 0)
-        portfolios = row[3] + (1 if portfolio else 0)
-        c.execute("UPDATE usage SET queries=?, portfolios=?, last_used=? WHERE user_id=?",
-                  (queries, portfolios, datetime.now(), user_id))
-    else:
-        c.execute("INSERT INTO usage (user_id, queries, portfolios, last_used) VALUES (?, ?, ?, ?)",
-                  (user_id, 1 if query else 0, 1 if portfolio else 0, datetime.now()))
-    conn.commit()
+    return response.choices[0].message.content
 
-def plot_stock_graph(df, stock_name):
-    """Show candlestick + moving averages"""
-    fig = go.Figure(data=[go.Candlestick(x=df.index,
-                                         open=df['Open'],
-                                         high=df['High'],
-                                         low=df['Low'],
-                                         close=df['Close'],
-                                         name="Candlestick")])
-    # Moving Averages
-    df["MA20"] = df["Close"].rolling(window=20).mean()
-    df["MA50"] = df["Close"].rolling(window=50).mean()
+# --------------------------
+# STREAMLIT UI
+# --------------------------
+st.set_page_config(page_title="📊 Stock Consultant Agent", layout="wide")
 
-    fig.add_trace(go.Scatter(x=df.index, y=df["MA20"], mode="lines", name="20-day MA"))
-    fig.add_trace(go.Scatter(x=df.index, y=df["MA50"], mode="lines", name="50-day MA"))
+st.title("📊 Stock Market Consultant Agent")
+st.write("Beginner-friendly stock advice using **real-time market data**.")
 
-    fig.update_layout(title=f"{stock_name} Stock Price",
-                      xaxis_title="Date", yaxis_title="Price (INR)",
-                      template="plotly_dark", height=600)
-    return fig
+# Sidebar User Info
+st.sidebar.header("👤 User Info")
+name = st.sidebar.text_input("Enter your name")
+portfolio = st.sidebar.text_area("Enter your portfolio (comma-separated stock symbols, e.g., RELIANCE.NS, TCS.NS)")
 
-# --- Streamlit App ---
-st.set_page_config(page_title="Stock Consultant Agent", layout="wide")
-st.title("📈 Stock Market Consultant Agent")
+if st.sidebar.button("Save User"):
+    if name and portfolio:
+        save_user(name, portfolio)
+        st.sidebar.success("✅ User saved successfully!")
 
-menu = ["Register", "Portfolio", "Ask Advice", "Usage"]
-choice = st.sidebar.radio("Menu", menu)
+# Main App
+if name and portfolio:
+    stocks = [s.strip() for s in portfolio.split(",") if s.strip()]
+    st.subheader(f"📌 Portfolio Analysis for {name}")
 
-if choice == "Register":
-    st.subheader("Register User")
-    name = st.text_input("Enter your name")
-    if st.button("Register"):
-        c.execute("INSERT INTO users (name, portfolio, created_at) VALUES (?, ?, ?)",
-                  (name, "", datetime.now()))
-        conn.commit()
-        st.success(f"✅ User {name} registered! Note your User ID from database.")
+    for stock in stocks:
+        st.markdown(f"### 📈 {stock}")
+        try:
+            data = get_stock_data(stock)
+            if not data.empty:
+                st.metric("Latest Price", f"₹{data['Close'].iloc[-1]:.2f}")
+                plot_stock(data, stock)
 
-elif choice == "Portfolio":
-    st.subheader("Enter Your Portfolio")
-    user_id = st.number_input("Enter your User ID", min_value=1, step=1)
-    portfolio = st.text_area("Enter stock symbols (comma separated, e.g., TCS.NS, INFY.NS, RELIANCE.NS)")
-    if st.button("Save Portfolio"):
-        c.execute("UPDATE users SET portfolio=? WHERE id=?", (portfolio, user_id))
-        conn.commit()
-        update_usage(user_id, portfolio=True)
-        st.success("📌 Portfolio saved successfully!")
+                # Generate AI advice
+                with st.spinner("Analyzing..."):
+                    advice = generate_advice(portfolio, data)
+                st.success(advice)
 
-elif choice == "Ask Advice":
-    st.subheader("Get Stock Advice")
-    user_id = st.number_input("Enter your User ID", min_value=1, step=1)
+                # Update usage
+                update_usage(name)
+            else:
+                st.warning(f"No data found for {stock}")
+        except Exception as e:
+            st.error(f"Error fetching data for {stock}: {e}")
 
-    c.execute("SELECT portfolio FROM users WHERE id=?", (user_id,))
-    row = c.fetchone()
+    usage_count = get_usage(name)
+    st.info(f"📊 You have asked for advice **{usage_count} times**.")
 
-    if row and row[0]:
-        stocks = row[0].split(",")
-        for stock in stocks:
-            stock = stock.strip()
-            try:
-                df = fetch_stock_data(stock)
-                if not df.empty:
-                    latest_price = df["Close"][-1]
-                    pct_change = ((df["Close"][-1] - df["Close"][-2]) / df["Close"][-2]) * 100
-                    advice = generate_advice(stock, latest_price, pct_change)
-
-                    st.markdown(f"### {stock}")
-                    st.write(f"💰 Price: {latest_price:.2f} INR | 📊 Change: {pct_change:.2f}%")
-                    st.info(advice)
-
-                    # Plot graph
-                    fig = plot_stock_graph(df, stock)
-                    st.plotly_chart(fig, use_container_width=True)
-
-                else:
-                    st.warning(f"No data found for {stock}")
-            except Exception as e:
-                st.error(f"❌ Error fetching {stock}: {e}")
-
-        update_usage(user_id, query=True)
-    else:
-        st.error("⚠️ No portfolio found for this user.")
-
-elif choice == "Usage":
-    st.subheader("Usage Statistics")
-    user_id = st.number_input("Enter your User ID", min_value=1, step=1)
-    c.execute("SELECT queries, portfolios, last_used FROM usage WHERE user_id=?", (user_id,))
-    row = c.fetchone()
-    if row:
-        st.write(f"📌 Queries Asked: {row[0]}")
-        st.write(f"📌 Portfolios Saved: {row[1]}")
-        st.write(f"📌 Last Used: {row[2]}")
-    else:
-        st.warning("No usage found for this user yet.")
-
+else:
+    st.warning("👉 Please enter your name and portfolio in the sidebar to get started.")
