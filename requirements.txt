@@ -7,3 +7,4 @@ pandas
 numpy
 requests
 google-genai
+matplotlib
