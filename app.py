@@ -1,157 +1,124 @@
-import os
-import sqlite3
-import yfinance as yf
-import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
+import yfinance as yf
+import sqlite3
+import datetime
+import pandas as pd
 from openai import OpenAI
 
-# --------------------------
-# API KEY SETUP
-# --------------------------
-api_key = None
-try:
-    api_key = st.secrets["OPENAI_API_KEY"]
-except Exception:
-    pass
+# =========================
+#  API SETUP
+# =========================
+# ✅ OPTION 1: Hardcode API key (for testing only!)
+client = OpenAI(api_key="sk-YOUR_REAL_KEY_HERE")
 
-if not api_key:
-    api_key = os.getenv("OPENAI_API_KEY")
+# ✅ OPTION 2 (Recommended for deployment):
+# client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-if not api_key:
-    api_key = "sk-your-test-key-here"  # Replace only for local testing
-
-client = OpenAI(api_key=api_key)
-
-# --------------------------
-# SQLITE DATABASE SETUP
-# --------------------------
-DB_FILE = "stock_consultant.db"
-
+# =========================
+#  DATABASE SETUP
+# =========================
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect("users.db")
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT,
-            portfolio TEXT,
-            usage_count INTEGER DEFAULT 0
+            email TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
     conn.close()
 
-def save_user(name, portfolio):
-    conn = sqlite3.connect(DB_FILE)
+def add_user(name, email):
+    conn = sqlite3.connect("users.db")
     c = conn.cursor()
-    c.execute("INSERT INTO users (name, portfolio, usage_count) VALUES (?, ?, ?)", 
-              (name, portfolio, 0))
+    c.execute("INSERT INTO users (name, email) VALUES (?, ?)", (name, email))
     conn.commit()
     conn.close()
 
-def update_usage(name):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("UPDATE users SET usage_count = usage_count + 1 WHERE name=?", (name,))
-    conn.commit()
-    conn.close()
+# =========================
+#  STOCK DATA FETCH
+# =========================
+def get_stock_data(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        data = stock.history(period="1mo")
+        if data.empty:
+            st.error("No data found for this ticker.")
+            return None
+        return data
+    except Exception as e:
+        st.error(f"Error fetching stock data: {e}")
+        return None
 
-def get_usage(name):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT usage_count FROM users WHERE name=?", (name,))
-    result = c.fetchone()
-    conn.close()
-    return result[0] if result else 0
+# =========================
+#  AI ADVICE
+# =========================
+def generate_advice(data, ticker):
+    latest_price = round(data["Close"].iloc[-1], 2)
+    pct_change = round(((data["Close"].iloc[-1] - data["Close"].iloc[0]) / data["Close"].iloc[0]) * 100, 2)
 
-init_db()
-
-# --------------------------
-# STOCK DATA FUNCTIONS
-# --------------------------
-def get_stock_data(symbol, period="6mo"):
-    stock = yf.Ticker(symbol)
-    data = stock.history(period=period)
-    return data
-
-def plot_stock(data, symbol):
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.plot(data.index, data["Close"], label="Close Price", color="blue")
-    ax.set_title(f"{symbol} Price Trend")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Price (₹)")
-    ax.legend()
-    st.pyplot(fig)
-
-# --------------------------
-# AI ADVICE GENERATOR
-# --------------------------
-def generate_advice(portfolio, stock_data):
     prompt = f"""
-    You are a financial consultant for beginner investors.
-    The user's portfolio is: {portfolio}.
-    Based on the latest stock data: {stock_data.tail(5).to_dict()},
-    provide simple advice:
-    - Whether to Buy, Hold, or Sell.
-    - Risk warnings (if any).
-    - Diversification tips.
-    Answer in plain English, short and clear.
+    You are a financial advisor. A beginner investor is asking about {ticker}.
+    The current price is {latest_price}, and the stock has changed {pct_change}% in the last month.
+    Give a clear and simple recommendation: BUY, SELL, or HOLD.
+    Also explain risks, beginner-friendly tips, and current market value insights.
     """
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "system", "content": "You are a helpful stock consultant."},
-                  {"role": "user", "content": prompt}]
-    )
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "system", "content": "You are a financial stock advisor."},
+                      {"role": "user", "content": prompt}]
+        )
+        advice = response.choices[0].message.content.strip()
+    except Exception as e:
+        advice = f"Error generating AI advice: {e}"
 
-    return response.choices[0].message.content
+    return latest_price, pct_change, advice
 
-# --------------------------
-# STREAMLIT UI
-# --------------------------
-st.set_page_config(page_title="📊 Stock Consultant Agent", layout="wide")
+# =========================
+#  STREAMLIT UI
+# =========================
+def main():
+    st.set_page_config(page_title="AI Stock Advisor", layout="wide")
+    st.title("📈 AI-Powered Stock Investment Advisor")
 
-st.title("📊 Stock Market Consultant Agent")
-st.write("Beginner-friendly stock advice using **real-time market data**.")
+    # User Registration
+    st.sidebar.header("👤 New User Registration")
+    name = st.sidebar.text_input("Name")
+    email = st.sidebar.text_input("Email")
+    if st.sidebar.button("Register"):
+        if name and email:
+            add_user(name, email)
+            st.sidebar.success("User registered successfully!")
+        else:
+            st.sidebar.error("Please enter both name and email.")
 
-# Sidebar User Info
-st.sidebar.header("👤 User Info")
-name = st.sidebar.text_input("Enter your name")
-portfolio = st.sidebar.text_area("Enter your portfolio (comma-separated stock symbols, e.g., RELIANCE.NS, TCS.NS)")
+    # Stock input
+    ticker = st.text_input("Enter Stock Ticker (e.g., TCS.NS, INFY.NS, AAPL)", "AAPL")
 
-if st.sidebar.button("Save User"):
-    if name and portfolio:
-        save_user(name, portfolio)
-        st.sidebar.success("✅ User saved successfully!")
+    if st.button("Get Stock Insights"):
+        data = get_stock_data(ticker)
+        if data is not None:
+            st.subheader(f"📊 Stock Data for {ticker}")
+            st.line_chart(data["Close"])
 
-# Main App
-if name and portfolio:
-    stocks = [s.strip() for s in portfolio.split(",") if s.strip()]
-    st.subheader(f"📌 Portfolio Analysis for {name}")
+            latest_price, pct_change, advice = generate_advice(data, ticker)
 
-    for stock in stocks:
-        st.markdown(f"### 📈 {stock}")
-        try:
-            data = get_stock_data(stock)
-            if not data.empty:
-                st.metric("Latest Price", f"₹{data['Close'].iloc[-1]:.2f}")
-                plot_stock(data, stock)
+            st.metric(label="Latest Price", value=f"${latest_price}")
+            st.metric(label="1-Month Change", value=f"{pct_change}%")
 
-                # Generate AI advice
-                with st.spinner("Analyzing..."):
-                    advice = generate_advice(portfolio, data)
-                st.success(advice)
+            st.subheader("🤖 AI Investment Advice")
+            st.write(advice)
 
-                # Update usage
-                update_usage(name)
-            else:
-                st.warning(f"No data found for {stock}")
-        except Exception as e:
-            st.error(f"Error fetching data for {stock}: {e}")
+            st.warning("⚠️ Investment Disclaimer: This is AI-generated advice. Please consult a financial advisor before making decisions.")
 
-    usage_count = get_usage(name)
-    st.info(f"📊 You have asked for advice **{usage_count} times**.")
-
-else:
-    st.warning("👉 Please enter your name and portfolio in the sidebar to get started.")
+# =========================
+#  RUN
+# =========================
+if __name__ == "__main__":
+    init_db()
+    main()
