@@ -6,4 +6,3 @@ plotly
 requests
 fpdf
 gTTS
-pymongo
