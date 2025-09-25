@@ -1,288 +1,530 @@
 # app.py
+"""
+Stock Market Consultant Agent - Full-featured Streamlit app
+Features:
+ - Portfolio input (manual + CSV upload)
+ - Live market data via yfinance (quotes + history)
+ - Technical indicators: MA, RSI, MACD (simple)
+ - Buy / Sell / Hold rules with plain-English reasoning
+ - Portfolio analytics: current value, P/L, allocation, volatility, Sharpe
+ - Graphs: price line, candlestick, RSI, allocation pie
+ - Usage tracking and billing (SQLite)
+ - Export JSON + PDF invoice/report
+ - Supports any ticker yfinance recognizes; optionally load tickers.csv for a master list
+"""
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import sqlite3
-import json
-from datetime import datetime
+import yfinance as yf
+import plotly.graph_objects as go
+import sqlite3, json, os
+from datetime import datetime, timedelta
 from io import BytesIO
+from fpdf import FPDF  # for simple PDF generation
+import math
 
-# -----------------------
-# Configuration / defaults
-# -----------------------
-DB_FILE = "usage.db"               # SQLite file saved in working dir
-MOCK_PRICE_CSV = "mock_prices.csv" # CSV (symbol,price) if available
-PER_ADVICE_CHARGE = 0.05           # Rupees/dollars per advice (mock)
-PER_ANALYSIS_CHARGE = 0.50         # Rupees/dollars per full portfolio analysis (mock)
+# ----------------------------
+# CONFIG
+# ----------------------------
+DB_FILE = "usage.db"
+PER_ADVICE_CHARGE = 0.1      # currency units per stock advice
+PER_ANALYSIS_CHARGE = 1.0    # currency units per portfolio analysis
+DEFAULT_TICKERS_FILE = "tickers.csv"  # optional master list
+# ----------------------------
 
-# -----------------------
-# Database helpers
-# -----------------------
+# ----------------------------
+# DB helpers
+# ----------------------------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''
-        CREATE TABLE IF NOT EXISTS usage (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            action TEXT,
-            detail TEXT,
-            charge REAL,
-            timestamp TEXT
-        )
-    ''')
+    CREATE TABLE IF NOT EXISTS usage (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      action TEXT, detail TEXT, charge REAL, timestamp TEXT
+    )''')
     c.execute('''
-        CREATE TABLE IF NOT EXISTS analyses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT,
-            portfolio_json TEXT,
-            advice_json TEXT,
-            timestamp TEXT
-        )
-    ''')
+    CREATE TABLE IF NOT EXISTS analyses (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT, portfolio_json TEXT, advice_json TEXT, charge REAL, timestamp TEXT
+    )''')
     conn.commit()
     conn.close()
 
-def log_usage(action: str, detail: str, charge: float=0.0):
+def log_usage(action, detail, charge=0.0):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('INSERT INTO usage (action, detail, charge, timestamp) VALUES (?, ?, ?, ?)',
+    c.execute('INSERT INTO usage (action, detail, charge, timestamp) VALUES (?,?,?,?)',
               (action, detail, charge, datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
 
-def save_analysis(user_id: str, portfolio: dict, advice: list):
+def save_analysis(user_id, portfolio, advice, charge):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('INSERT INTO analyses (user_id, portfolio_json, advice_json, timestamp) VALUES (?, ?, ?, ?)',
-              (user_id, json.dumps(portfolio), json.dumps(advice), datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
+    c.execute('INSERT INTO analyses (user_id, portfolio_json, advice_json, charge, timestamp) VALUES (?,?,?,?,?)',
+              (user_id, json.dumps(portfolio), json.dumps(advice), charge, datetime.utcnow().isoformat()))
+    conn.commit(); conn.close()
 
 def get_usage_summary():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('SELECT action, COUNT(*), SUM(charge) FROM usage GROUP BY action')
-    rows = c.fetchall()
-    conn.close()
+    rows = c.fetchall(); conn.close()
     return rows
 
 def get_recent_analyses(limit=10):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('SELECT id, user_id, portfolio_json, advice_json, timestamp FROM analyses ORDER BY id DESC LIMIT ?', (limit,))
-    rows = c.fetchall()
-    conn.close()
+    c.execute('SELECT id, user_id, portfolio_json, advice_json, charge, timestamp FROM analyses ORDER BY id DESC LIMIT ?', (limit,))
+    rows = c.fetchall(); conn.close()
     return rows
 
-# -----------------------
-# Mock price fetcher (Pathway simulation)
-# -----------------------
-@st.cache_data
-def load_mock_prices():
-    # Try to load CSV from repo; if not available, generate mock prices
+# ----------------------------
+# Market data helpers (yfinance)
+# ----------------------------
+@st.cache_data(ttl=60)  # cache for 60 seconds for "real-time-ish" performance
+def fetch_ticker_info(ticker):
+    t = yf.Ticker(ticker)
+    info = t.info
+    return info
+
+@st.cache_data(ttl=60)
+def fetch_history(ticker, period="6mo", interval="1d"):
+    t = yf.Ticker(ticker)
+    df = t.history(period=period, interval=interval)
+    if df.empty:
+        return pd.DataFrame()
+    df = df.reset_index()
+    df['Date'] = pd.to_datetime(df['Date'])
+    return df
+
+# quick quote
+@st.cache_data(ttl=20)
+def get_quote(ticker):
+    t = yf.Ticker(ticker)
+    q = t.history(period="2d", interval="1d")  # fallback
+    # use fast method
     try:
-        df = pd.read_csv(MOCK_PRICE_CSV)
-        if 'symbol' in df.columns and 'price' in df.columns:
-            df = df[['symbol','price']].drop_duplicates().set_index('symbol')
-            return df['price'].to_dict()
+        last = t.info.get('regularMarketPrice', None)
     except Exception:
-        pass
-    # fallback: generate random prices for common tickers
-    base = {'AAPL': 170, 'GOOGL': 2800, 'TCS': 3200, 'INFY': 1500, 'MSFT': 340, 'RELIANCE': 2350}
-    prices = {k: float(v * (0.9 + 0.2*np.random.rand())) for k,v in base.items()}
-    return prices
+        last = None
+    # fallback to history close
+    if last is None and not q.empty:
+        last = float(q['Close'].iloc[-1])
+    return last
 
-def get_price(symbol: str, price_map: dict):
-    symbol = symbol.upper().strip()
-    return float(price_map.get(symbol, np.round(10 + 990*np.random.rand(),2)))
+# ----------------------------
+# Technical indicators
+# ----------------------------
+def add_moving_averages(df, windows=[20,50,200]):
+    for w in windows:
+        df[f"MA_{w}"] = df['Close'].rolling(window=w).mean()
+    return df
 
-# -----------------------
-# Advice engine (simple heuristics)
-# -----------------------
-def analyze_portfolio(portfolio: dict, price_map: dict):
+def compute_RSI(df, period=14):
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    df['RSI'] = rsi
+    return df
+
+# simple MACD
+def compute_MACD(df, a=12, b=26, c=9):
+    df['EMA_fast'] = df['Close'].ewm(span=a, adjust=False).mean()
+    df['EMA_slow'] = df['Close'].ewm(span=b, adjust=False).mean()
+    df['MACD'] = df['EMA_fast'] - df['EMA_slow']
+    df['MACD_signal'] = df['MACD'].ewm(span=c, adjust=False).mean()
+    return df
+
+# ----------------------------
+# Advice engine (rules + beginner friendly explanation)
+# ----------------------------
+def compute_signals(df):
+    signals = {}
+    if df.empty:
+        return signals
+    latest = df.iloc[-1]
+    # MA cross (using MA_50 and MA_200)
+    try:
+        ma50 = latest.get('MA_50', None)
+        ma200 = latest.get('MA_200', None)
+    except:
+        ma50 = ma200 = None
+    # RSI
+    rsi = latest.get('RSI', None)
+    # MACD
+    macd = latest.get('MACD', None)
+    macd_signal = latest.get('MACD_signal', None)
+
+    # simple rules
+    if ma50 and ma200:
+        if ma50 > ma200:
+            signals['ma'] = ('bullish', "50-day MA is above 200-day MA (uptrend).")
+        else:
+            signals['ma'] = ('bearish', "50-day MA is below 200-day MA (downtrend).")
+
+    if rsi is not None:
+        if rsi < 30:
+            signals['rsi'] = ('oversold', f"RSI={rsi:.1f} (oversold). Potential buying opportunity for long-term investors.")
+        elif rsi > 70:
+            signals['rsi'] = ('overbought', f"RSI={rsi:.1f} (overbought). Consider taking profits or wait.")
+        else:
+            signals['rsi'] = ('neutral', f"RSI={rsi:.1f} (neutral).")
+
+    if macd is not None and macd_signal is not None:
+        if macd > macd_signal:
+            signals['macd'] = ('bullish', "MACD line above signal line (momentum improving).")
+        else:
+            signals['macd'] = ('bearish', "MACD line below signal line (momentum weakening).")
+
+    return signals
+
+def stock_advice(ticker, qty, buy_price, timeframe='short'):
     """
-    portfolio: { "userId":str, "stocks":[{"name":str,"quantity":int,"buyPrice":float}, ...] }
-    returns: list of advice dicts
+    Returns dict with currentPrice, pnl_pct, recommendation (Buy/Sell/Hold/Strong Buy/Strong Sell),
+    and a beginner-friendly explanation.
+    timeframe: 'short' or 'long' affects recommendation thresholds
     """
+    df = fetch_history(ticker, period="1y", interval="1d")
+    if df.empty:
+        return {"error": "No data for ticker"}
+    df = add_moving_averages(df, windows=[20,50,200])
+    df = compute_RSI(df)
+    df = compute_MACD(df)
+    current = get_quote(ticker)
+    buy_price = float(buy_price or 0)
+    qty = float(qty or 0)
+    value = current * qty
+    pnl_pct = ((current - buy_price) / buy_price * 100) if buy_price>0 else None
+
+    signals = compute_signals(df)
+
+    # rule-based recommendation (combining signals)
+    score = 0
+    reasons = []
+    # MA signal
+    ma = signals.get('ma', (None,''))[0]
+    if ma == 'bullish':
+        score += 2
+        reasons.append("Long-term trend looks positive (MA crossover).")
+    elif ma == 'bearish':
+        score -= 2
+        reasons.append("Long-term trend looks negative (MA crossover).")
+    # MACD
+    macd = signals.get('macd', (None,''))[0]
+    if macd == 'bullish':
+        score += 1
+    elif macd == 'bearish':
+        score -= 1
+    # RSI
+    rsi_tag = signals.get('rsi', (None,''))[0]
+    if rsi_tag == 'oversold':
+        score += 1
+        reasons.append("RSI indicates oversold conditions (possible buy).")
+    elif rsi_tag == 'overbought':
+        score -= 1
+        reasons.append("RSI indicates overbought conditions (consider taking profits).")
+
+    # PnL threshold adjustments depending on timeframe
+    if pnl_pct is not None:
+        if timeframe == 'short':
+            if pnl_pct <= -5:
+                score -= 1; reasons.append("Short-term loss >5% — consider stop-loss.")
+            if pnl_pct >= 8:
+                score += 1; reasons.append("Short-term gain >8% — consider booking partial profits.")
+        else:  # long
+            if pnl_pct <= -20:
+                score -= 2; reasons.append("Long-term loss >20% — review position.")
+            if pnl_pct >= 50:
+                score += 2; reasons.append("Long-term gain >50% — consider rebalancing/taking profits.")
+
+    # Final recommendation mapping
+    if score >= 3:
+        rec = "Strong Buy"
+    elif score == 2:
+        rec = "Buy"
+    elif score == 1 or score == 0:
+        rec = "Hold"
+    elif score == -1 or score == -2:
+        rec = "Reduce / Take Profit"
+    else:
+        rec = "Sell / Cut Loss"
+
+    # Beginner friendly explanation
+    explanation = " ".join(reasons) if reasons else "No strong technical signals; consider your investment horizon and risk tolerance."
+
+    return {
+        "ticker": ticker.upper(),
+        "currentPrice": round(current,2) if current else None,
+        "quantity": qty,
+        "buyPrice": buy_price,
+        "value": round(value,2),
+        "pnl_pct": round(pnl_pct,2) if pnl_pct is not None else None,
+        "score": score,
+        "recommendation": rec,
+        "explanation": explanation,
+        "signals": signals
+    }
+
+# ----------------------------
+# Portfolio analytics
+# ----------------------------
+def analyze_portfolio(portfolio: dict, timeframe='long'):
+    """
+    portfolio: {'userId':..., 'stocks': [{'name','quantity','buyPrice'},...]}
+    Returns: detailed advice for each stock, portfolio summary
+    """
+    stocks = portfolio.get('stocks', [])
     advices = []
     total_value = 0.0
-    # compute current values and basic metrics
-    for s in portfolio.get('stocks', []):
-        name = s.get('name','').upper()
-        qty = float(s.get('quantity',0) or 0)
-        buy = float(s.get('buyPrice',0) or 0)
-        current = get_price(name, price_map)
-        value = current * qty
-        pnl_pct = ((current - buy) / buy * 100) if buy>0 else None
-        adv = {
-            'stock': name,
-            'quantity': qty,
-            'buyPrice': buy,
-            'currentPrice': current,
-            'value': round(value,2),
-            'pnl_pct': round(pnl_pct,2) if pnl_pct is not None else None
-        }
+    values = []
+    # per-stock advice
+    for s in stocks:
+        name = s.get('name')
+        qty = s.get('quantity', 0)
+        buy = s.get('buyPrice', 0)
+        adv = stock_advice(name, qty, buy, timeframe=timeframe)
+        if 'error' in adv:
+            continue
         advices.append(adv)
-        total_value += value
-
-    # diversification and per-stock recommendation
-    # compute weight of each holding
-    for a in advices:
-        weight = (a['value'] / total_value * 100) if total_value>0 else 0
-        a['weight_pct'] = round(weight,2)
-        # simple rules:
-        # - If pnl_pct < -15% -> suggest consider selling (cut losses)
-        # - If pnl_pct > 25% -> suggest consider taking profit
-        # - If weight_pct > 40% -> suggest diversify
-        # - If stock not in important sector (mock) -> suggest consider adding top IT (INFY/TCS)
-        suggestion = "Hold"
-        reasons = []
-        if a['pnl_pct'] is not None:
-            if a['pnl_pct'] <= -15:
-                suggestion = "Reduce"
-                reasons.append("Unrealized loss > 15%")
-            elif a['pnl_pct'] >= 25:
-                suggestion = "Consider Taking Profit"
-                reasons.append("Unrealized gain > 25%")
-        if a['weight_pct'] >= 40:
-            suggestion = "Diversify"
-            reasons.append("Single stock >40% portfolio")
-        # if small pos and small qty, encourage buy if price low (demo logic)
-        if a['quantity']>0 and a['pnl_pct'] is not None and abs(a['pnl_pct']) < 3 and weight < 5:
-            reasons.append("Small position; consider increasing for diversification")
-        a['suggestion'] = suggestion
-        a['reason'] = "; ".join(reasons) if reasons else "No strong signal"
-
-    # top-level portfolio advice (plain english)
-    portfolio_advice = []
-    if len(advices)==0:
-        portfolio_advice.append("No stocks in portfolio. Add holdings to get advice.")
+        total_value += adv['value']
+        values.append({'ticker': adv['ticker'], 'value': adv['value'], 'pnl_pct': adv['pnl_pct']})
+    # portfolio metrics
+    # weights
+    for v in values:
+        v['weight_pct'] = round((v['value'] / total_value * 100) if total_value>0 else 0,2)
+    # simple volatility & Sharpe approx using historical daily returns
+    returns = []
+    for s in stocks:
+        df = fetch_history(s['name'], period="6mo", interval="1d")
+        if df.empty: continue
+        df['ret'] = df['Close'].pct_change()
+        returns.append(df['ret'].dropna())
+    if returns:
+        allrets = pd.concat(returns)
+        vol = float(allrets.std() * math.sqrt(252))  # annualized volatility
+        sharpe = float((allrets.mean() * 252) / (allrets.std() * math.sqrt(252))) if allrets.std()!=0 else None
     else:
-        # diversification check (count sectors via symbol heuristics)
-        heavy = [a for a in advices if a['weight_pct']>=40]
-        if heavy:
-            portfolio_advice.append("Your portfolio has a concentration risk: consider reducing the largest positions.")
-        # check missing IT if none in advices
-        names = [a['stock'] for a in advices]
-        if not any(x in names for x in ['INFY','TCS','WIPRO']):
-            portfolio_advice.append("Consider adding IT stocks (e.g., INFY, TCS) to improve diversification.")
-    # Return both detailed advices and top-level sentences
-    return advices, portfolio_advice, round(total_value,2)
+        vol = None; sharpe = None
 
-# -----------------------
-# UI Components
-# -----------------------
-def render_header():
-    st.title("Stock Consultant Agent — Streamlit Demo")
-    st.caption("Simple demo of portfolio advice, usage and billing (mock Pathway & Flexprice integration)")
+    summary = {
+        "total_value": round(total_value,2),
+        "positions": values,
+        "annual_volatility": round(vol,4) if vol else None,
+        "sharpe": round(sharpe,3) if sharpe else None
+    }
 
-def portfolio_input_ui():
-    st.header("Enter Portfolio")
-    st.write("Add holdings manually or upload a CSV with columns: name,quantity,buyPrice")
-    with st.form("portfolio_form", clear_on_submit=False):
-        user_id = st.text_input("User ID", value="hema123")
-        add_row = st.checkbox("Start with an example entry", value=True)
-        # interactive table building (simple)
-        rows = []
-        if add_row:
-            default_df = pd.DataFrame([{"name":"AAPL","quantity":10,"buyPrice":150},{"name":"GOOGL","quantity":5,"buyPrice":2800}])
-        else:
-            default_df = pd.DataFrame(columns=["name","quantity","buyPrice"])
-        upfile = st.file_uploader("Upload CSV (optional)", type=['csv'])
-        if upfile is not None:
-            try:
-                csv_df = pd.read_csv(upfile)
-                default_df = csv_df[['name','quantity','buyPrice']]
-            except Exception as e:
-                st.error("CSV read error: "+str(e))
-        st.write("Current portfolio (editable in CSV upload) — displayed for review:")
-        st.dataframe(default_df)
-        submitted = st.form_submit_button("Analyze Portfolio")
-        if submitted:
-            # build portfolio dict
-            portfolio = {"userId": user_id, "stocks": default_df.to_dict(orient='records')}
-            return portfolio
-    return None
+    return advices, summary
 
-def display_advice_and_actions(portfolio, adv_result, portfolio_advice, total_value):
-    st.subheader("Analysis Results")
-    st.write(f"User: **{portfolio.get('userId','-')}** — Total Value (mock): **{total_value}**")
-    st.write("Top-level portfolio advice:")
-    for s in portfolio_advice:
-        st.info(s)
-    st.markdown("**Per-stock details & suggestions**")
-    df = pd.DataFrame(adv_result)
-    st.dataframe(df)
-    # show download JSON of the analysis
-    if st.button("Save this analysis & generate report"):
-        save_analysis(portfolio.get('userId',''), portfolio, adv_result)
-        log_usage("portfolio_analysis", f"user={portfolio.get('userId','')}", PER_ANALYSIS_CHARGE)
-        st.success("Analysis saved. Billing recorded.")
-        # also record per-advice charges
-        n = len(adv_result)
-        if n>0:
-            log_usage("advice_batch", f"user={portfolio.get('userId','')},count={n}", PER_ADVICE_CHARGE * n)
+# ----------------------------
+# UI Helpers & plots
+# ----------------------------
+def plot_price_chart(df, ticker):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['Close'], name='Close', mode='lines'))
+    if 'MA_20' in df.columns:
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['MA_20'], name='MA 20'))
+    if 'MA_50' in df.columns:
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['MA_50'], name='MA 50'))
+    if 'MA_200' in df.columns:
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['MA_200'], name='MA 200'))
+    fig.update_layout(title=f"{ticker} price chart", xaxis_title="Date", yaxis_title="Price")
+    return fig
 
-def download_json(name: str, obj):
+def plot_candlestick(df, ticker):
+    fig = go.Figure(data=[go.Candlestick(x=df['Date'],
+                open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'])])
+    fig.update_layout(title=f"{ticker} Candlestick", xaxis_rangeslider_visible=False)
+    return fig
+
+def plot_rsi(df):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df['Date'], y=df['RSI'], name='RSI'))
+    fig.update_layout(title="RSI", yaxis=dict(range=[0,100]))
+    fig.add_hline(y=70, line_dash="dash", line_color="red")
+    fig.add_hline(y=30, line_dash="dash", line_color="green")
+    return fig
+
+# PDF invoice generation
+def generate_pdf_invoice(user_id, analysis_id, portfolio, advices, charge):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    pdf.cell(200,10, txt="Stock Consultant Agent - Analysis Invoice", ln=True, align='C')
+    pdf.ln(5)
+    pdf.cell(200,10, txt=f"Analysis ID: {analysis_id}  User: {user_id}", ln=True)
+    pdf.cell(200,10, txt=f"Timestamp: {datetime.utcnow().isoformat()}", ln=True)
+    pdf.ln(5)
+    pdf.cell(200,10, txt=f"Charge: {charge} (mock currency)", ln=True)
+    pdf.ln(5)
+    pdf.cell(200,10, txt="Portfolio Snapshot:", ln=True)
+    for s in portfolio.get('stocks', []):
+        pdf.cell(200,8, txt=f"- {s['name']} | qty: {s['quantity']} | buyPrice: {s['buyPrice']}", ln=True)
+    pdf.ln(5)
+    pdf.cell(200,10, txt="Advice:", ln=True)
+    for a in advices:
+        pdf.multi_cell(0, 6, txt=f"{a['ticker']}: {a['recommendation']} — {a['explanation']}")
+    # return bytes
     b = BytesIO()
-    b.write(json.dumps(obj, indent=2).encode('utf-8'))
+    pdf.output(b)
     b.seek(0)
-    st.download_button(label=f"Download {name}.json", data=b, file_name=f"{name}.json", mime="application/json")
+    return b
 
-def show_usage_and_billing():
-    st.header("Usage & Billing (Flexprice Simulation)")
-    rows = get_usage_summary()
-    if not rows:
-        st.info("No usage recorded yet.")
-        return
-    df = pd.DataFrame(rows, columns=['action','count','total_charge'])
-    st.table(df)
-    total_charge = df['total_charge'].sum()
-    st.write("**Total charges (mock):** ", total_charge)
-    # show recent analyses
-    st.subheader("Recent Analyses")
-    rows2 = get_recent_analyses(10)
-    if rows2:
-        for r in rows2:
-            idx, user_id, portfolio_json, advice_json, ts = r
-            st.markdown(f"**Analysis #{idx}** — user: {user_id} — {ts}")
-            st.write("Portfolio:")
-            st.json(json.loads(portfolio_json))
-            st.write("Advice:")
-            st.json(json.loads(advice_json))
-            if st.button(f"Download report #{idx}"):
-                report = {'id': idx, 'user': user_id, 'portfolio': json.loads(portfolio_json), 'advice': json.loads(advice_json), 'timestamp': ts}
-                download_json(f"analysis_{idx}", report)
-
-# -----------------------
-# Main app
-# -----------------------
+# ----------------------------
+# Page layout
+# ----------------------------
 def main():
     st.set_page_config(page_title="Stock Consultant Agent", layout="wide")
     init_db()
-    render_header()
-    price_map = load_mock_prices()
 
+    st.title("Stock Market Consultant Agent — Complete")
+    st.markdown("**Disclaimer:** This app provides educational guidance and is not financial advice. Always verify before trading.")
+
+    # left: portfolio input, right: live market / search
     col1, col2 = st.columns([2,1])
-    with col1:
-        portfolio = portfolio_input_ui()
-        if portfolio:
-            adv_result, portfolio_advice, total_value = analyze_portfolio(portfolio, price_map)
-            display_advice_and_actions(portfolio, adv_result, portfolio_advice, total_value)
-            # allow immediate download as JSON
-            if st.button("Download analysis JSON"):
-                analysis = {"portfolio": portfolio, "advice": adv_result, "summary": portfolio_advice, "total_value": total_value}
-                download_json("analysis", analysis)
+
+    # LOAD master tickers list if provided
+    tickers_list = []
+    if os.path.exists(DEFAULT_TICKERS_FILE):
+        try:
+            df_t = pd.read_csv(DEFAULT_TICKERS_FILE)
+            if 'symbol' in df_t.columns:
+                tickers_list = df_t['symbol'].astype(str).tolist()
+        except Exception:
+            tickers_list = []
+
     with col2:
-        st.sidebar.title("Quick Controls")
-        st.sidebar.write("Mock data source: Pathway (CSV fallback used)")
-        st.sidebar.write(f"Per-advice charge: {PER_ADVICE_CHARGE}")
-        st.sidebar.write(f"Per-analysis charge: {PER_ANALYSIS_CHARGE}")
-        if st.sidebar.button("Show Usage & Billing"):
-            show_usage_and_billing()
+        st.header("Market Lookup")
+        search_ticker = st.text_input("Enter ticker (e.g. AAPL, TCS.NS)", value="AAPL")
+        if st.button("Lookup"):
+            try:
+                q = get_quote(search_ticker)
+                info = fetch_ticker_info(search_ticker)
+                st.metric(label=f"{search_ticker} price", value=q)
+                st.json({k: info.get(k) for k in ['sector','industry','marketCap','regularMarketPrice'] if k in info})
+                # show recent chart
+                df = fetch_history(search_ticker, period="3mo")
+                if not df.empty:
+                    df = add_moving_averages(df, [20,50,200])
+                    df = compute_RSI(df)
+                    st.plotly_chart(plot_price_chart(df, search_ticker), use_container_width=True)
+                    st.plotly_chart(plot_candlestick(df, search_ticker), use_container_width=True)
+                    st.plotly_chart(plot_rsi(df), use_container_width=True)
+                    # signals summary
+                    signals = compute_signals(df)
+                    st.write("Signals:")
+                    st.write(signals)
+            except Exception as e:
+                st.error("Lookup failed: " + str(e))
+
+    with col1:
+        st.header("Portfolio Input & Analysis")
+        st.write("Add holdings manually below, or upload a CSV with columns: name,quantity,buyPrice")
+        with st.form("portfolio_form"):
+            user_id = st.text_input("User ID", value="hema_user")
+            default = st.checkbox("Load example portfolio", value=True)
+            upload = st.file_uploader("Upload CSV (optional)", type=['csv'])
+            if upload:
+                try:
+                    df = pd.read_csv(upload)
+                    df = df[['name','quantity','buyPrice']]
+                except Exception as e:
+                    st.error("CSV error: "+str(e)); df = pd.DataFrame(columns=['name','quantity','buyPrice'])
+            else:
+                if default:
+                    df = pd.DataFrame([{"name":"AAPL","quantity":10,"buyPrice":150},
+                                       {"name":"MSFT","quantity":5,"buyPrice":300}])
+                else:
+                    df = pd.DataFrame(columns=['name','quantity','buyPrice'])
+            st.dataframe(df)
+            timeframe = st.selectbox("Advice timeframe", ["short", "long"], index=1)
+            analyze = st.form_submit_button("Analyze Portfolio")
+        if analyze:
+            # build portfolio
+            portfolio = {"userId": user_id, "stocks": df.to_dict(orient='records')}
+            # get advices
+            advs, summary = analyze_portfolio(portfolio, timeframe=timeframe)
+            # show summary
+            st.subheader("Portfolio Summary")
+            st.metric("Total value (mock real-time)", f"{summary['total_value']}")
+            if summary.get('annual_volatility') is not None:
+                st.write(f"Annual vol: {summary['annual_volatility']}, Sharpe (approx): {summary['sharpe']}")
+            # allocation pie
+            if summary['positions']:
+                dfpos = pd.DataFrame(summary['positions'])
+                figpie = go.Figure(data=[go.Pie(labels=dfpos['ticker'], values=dfpos['value'], hole=.3)])
+                st.plotly_chart(figpie, use_container_width=True)
+            # show advices table
+            if advs:
+                st.subheader("Per-stock Advice")
+                dft = pd.DataFrame(advs)
+                st.dataframe(dft[['ticker','quantity','buyPrice','currentPrice','pnl_pct','recommendation']])
+                # detailed expanders
+                for a in advs:
+                    with st.expander(f"{a['ticker']} — {a['recommendation']}"):
+                        st.write("Current price:", a['currentPrice'])
+                        st.write("P/L %:", a['pnl_pct'])
+                        st.write("Reasoning:", a['explanation'])
+                        st.json(a['signals'])
+                        # charts for each
+                        dfh = fetch_history(a['ticker'], period="6mo")
+                        if not dfh.empty:
+                            dfh = add_moving_averages(dfh, [20,50,200])
+                            dfh = compute_RSI(dfh)
+                            st.plotly_chart(plot_price_chart(dfh, a['ticker']), use_container_width=True)
+            else:
+                st.info("No positions or no data found.")
+            # Billing & saving
+            n = len(advs)
+            charge = PER_ANALYSIS_CHARGE + PER_ADVICE_CHARGE * n
+            st.write(f"Charge for this analysis (mock): {charge}")
+            if st.button("Save analysis & generate invoice"):
+                save_analysis(user_id, portfolio, advs, charge)
+                log_usage("analysis_saved", f"user={user_id},count={n}", charge)
+                st.success("Saved. Invoice available in Usage & Billing.")
+                # retrieve latest analysis id
+                recent = get_recent_analyses(1)
+                if recent:
+                    aid = recent[0][0]
+                    pdfb = generate_pdf_invoice(user_id, aid, portfolio, advs, charge)
+                    st.download_button("Download Invoice PDF", data=pdfb, file_name=f"invoice_{aid}.pdf", mime="application/pdf")
+            # immediate json download
+            st.download_button("Download analysis JSON", data=json.dumps({"portfolio":portfolio,"advice":advs,"summary":summary}, indent=2), file_name="analysis.json")
 
     st.markdown("---")
-    st.markdown("**Notes:** This is a demo. Pathway & Flexprice are simulated. For production, replace mock price fetching with a real market-data API and integrate real billing SDKs.")
+    # Usage & billing panel
+    st.header("Usage & Billing")
+    rows = get_usage_summary()
+    if rows:
+        dfu = pd.DataFrame(rows, columns=['action','count','total_charge'])
+        st.table(dfu)
+        st.write("Total charges (mock):", dfu['total_charge'].sum())
+    else:
+        st.info("No usage recorded yet.")
+
+    st.markdown("---")
+    # Education section
+    st.header("Beginner's Guide: How to Invest")
+    st.markdown("""
+    **Steps for a beginner**
+    1. Start with goal: Define time horizon (short <1yr, medium 1-3yr, long >3yr).  
+    2. Build emergency fund before investing.  
+    3. Diversify across sectors and avoid concentration > 30-40%.  
+    4. For long-term investing: focus on fundamentals (earnings, revenue growth, ROE).  
+    5. For short-term trading: combine technical signals (MAs, RSI) with strict stop-loss rules.  
+    6. Always size positions relative to portfolio risk (e.g., 1-5% of portfolio per trade).
+    """)
+    st.markdown("**When to buy / sell / hold (plain English):**")
+    st.markdown("""
+    - **Buy** when the long-term trend is positive (MA crossover), the stock is not overbought (RSI < 70), and you have conviction in fundamentals.  
+    - **Sell / Reduce** when the stock is overconcentrated, fundamentals deteriorate, or technicals show reversal and you hit stop-loss.  
+    - **Hold** when there are mixed signals or you're long-term focused and short-term volatility appears.
+    """)
+    st.markdown("---")
+    st.caption("App note: Real-time data depends on yfinance. For production-grade real-time, integrate a market-data API with websocket support or paid data provider.")
 
 if __name__ == "__main__":
     main()
