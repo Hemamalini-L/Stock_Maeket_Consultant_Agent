@@ -1,15 +1,6 @@
 streamlit
-plotly
-agno
-openai
-yfinance
 pandas
 numpy
-requests
-google-genai
-matplotlib
-deepagents
-langchain
-langchain-openai
+yfinance
+plotly
 fpdf
-
