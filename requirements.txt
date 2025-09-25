@@ -5,3 +5,5 @@ yfinance
 plotly
 requests
 fpdf
+gTTS
+pymongo
