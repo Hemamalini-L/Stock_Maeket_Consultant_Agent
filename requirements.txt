@@ -11,4 +11,5 @@ matplotlib
 deepagents
 langchain
 langchain-openai
+fpdf
 
